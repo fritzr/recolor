@@ -7,7 +7,8 @@ import os
 import select
 import re
 import time
-
+import shutil
+import fcntl
 
 if sys.version_info[0] == 3:
     from io import StringIO
@@ -117,12 +118,14 @@ class ColorMatch(object):
 
 class unbuffered_stream(object):
     def __init__(self, istream):
-        self.infd = istream.fileno()
+        self.fd = istream.fileno()
+        fcntl.fcntl(self.fd, fcntl.F_SETFL, os.O_NONBLOCK)
+        self.fdlist = [self.fd]
         self.mask = (
             select.POLLIN | select.POLLHUP | select.POLLNVAL | select.POLLERR
         )
         self.poller = select.poll()
-        self.poller.register(self.infd, self.mask)
+        self.poller.register(self.fd, self.mask)
         self.istream = istream
         self.closed = False
 
@@ -133,47 +136,27 @@ class unbuffered_stream(object):
         If no characters are available right now, return the empty string.
         If the stream is closed or encountered an error, return None."""
         if self.closed:
-            return None
+            yield None
 
-        # When we _first_ check for characters, it is okay to wait for some to
-        # appear. It is only once a set of characters appear on the input that
-        # we want to eat them all with no timeout and return them.
-        line = StringIO()
-        check_list = self.poller.poll(1)
-        while check_list and not self.closed:
-            # The poller should have at most one element for istream.
-            fd, event = check_list[0]
-            # assert(fd == self.infd)
+        rl, wl, xl = select.select(self.fdlist, self.fdlist, self.fdlist, 1)
+        results = self.poller.poll(0)
+        event = None
+        for pollfd, pevent in results:
+            if pollfd == self.fd:
+                event = pevent
+                break
 
-            # Collect characters into the line one-by-one.
-            # See if we have any more characters for next time.
-            if event & select.POLLIN != 0:
-                # If we encounter a new line, go ahead and yield to improve the
-                # reliability of matching patterns like ^ and $.
-                ch = self.istream.read(1)
-                line.write(ch)
-                if ch == "\n":
-                    break
-                check_list = self.poller.poll(0)
+        if event is not None:
+            if event & select.POLLNVAL:
+                raise OSError(errno.EINVAL, os.strerror(errno.EINVAL), self.fd)
+            elif event & select.POLLIN:
+                # yield available data
+                yield self.istream.read()
+            elif event & (select.POLLHUP | select.POLLERR):
+                yield None
 
-            # For any other event, the stream must be dead.
-            elif event != 0:
-                self.closed = True
-
-        # Return any characters we have found so far.
-        # Even if we are done, we should return any characters we read
-        # this time, then return None next time (remembered by self.closed).
-        if line:
-            ret = line.getvalue()
-            line.close()
-            return ret
-
-        # Once we are done, if we have no input, return None.
-        if self.closed:
-            return None
-
-        # If we got no input but still aren't done, just return empty string.
-        return ""
+        # Nothing available at the moment.
+        yield ""
 
     def __iter__(self):
         """Return an iterator yielding a sequence of unbuffered input
@@ -187,16 +170,19 @@ class unbuffered_stream(object):
         """
         # Get available input characters in chunks.  Whence line is None, the
         # stream has been shutdown or experienced an error
-        line = self._get_chars()
-        while line is not None:
-            # Yield non-empty sequences.
-            # Empty sequences may appear when the stream has nothing for us yet
-            # but we greedily checked anyway.
-            if line:
-                yield line
+        while True:
             # Don't eat the CPU spinning on empty input.
             time.sleep(0.10)
-            line = self._get_chars()
+            for line in self._get_chars():
+                # Yield non-empty sequences.
+                # Empty sequences may appear when the stream has nothing for us yet
+                # but we greedily checked anyway.
+                if line is None:
+                    break
+                if line:
+                    yield line
+            if line is None:
+                break
 
 
 def select_lines(istream):
